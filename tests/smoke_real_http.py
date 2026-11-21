@@ -2,7 +2,8 @@
 
 Exercises the whole acceptance flow over TCP:
   meta -> range miss -> range hit -> switch -> old cached OK ->
-  old missing 410 -> new version 206 -> slow origin vs cache hit.
+  old missing 410 -> new version 206 -> slow origin vs cache hit ->
+  billed window open/download/usage/429/409.
 """
 
 import json
@@ -110,6 +111,46 @@ check("unsatisfiable range -> 416", status == 416 and headers.get("content-range
 _, _, body = request(GW + "/cache/stats")
 stats = json.loads(body)
 check("cache stats present", {"hits", "misses", "origin_range_requests", "cached_chunks"} <= set(stats), str(stats))
+
+# 12. billed download window: open, download, usage, stale, 429
+status, headers, body = request(
+    GW + "/billing/windows",
+    method="POST",
+    headers={"Content-Type": "application/json"},
+    data=json.dumps({"site": "smoke-site", "budget_bytes": 150}).encode(),
+)
+opened = json.loads(body)
+window = opened["window_id"]
+check("window opened without origin", status == 201 and headers.get("x-download-window") == str(window), str(opened))
+check("window download path in body", opened["download_path"] == "/billing/firmware.bin")
+
+billed = f"{GW}/billing/firmware.bin?site=smoke-site&window={window}"
+status, headers, body = request(billed, headers={"If-Match": new_etag, "Range": "bytes=100-199"})
+check("billed download 206", status == 206 and len(body) == 100, f"status={status}")
+_, _, body = request(GW + "/billing/windows/smoke-site")
+used = json.loads(body)["used_bytes"]
+check("used bytes = returned body bytes", used == 100, f"used={used}")
+
+status, headers, body = request(billed, headers={"If-Match": new_etag, "Range": "bytes=100-199"})
+check("budget exhausted -> 429 even on cache hit", status == 429, f"status={status}")
+
+status, headers, body = request(
+    GW + "/billing/windows",
+    method="POST",
+    headers={"Content-Type": "application/json"},
+    data=json.dumps({"site": "smoke-site", "budget_bytes": 4096}).encode(),
+)
+new_window = json.loads(body)["window_id"]
+check("replacement window opened", status == 201 and new_window != window)
+
+status, _, _ = request(billed, headers={"If-Match": new_etag, "Range": "bytes=0-9"})
+check("old window id -> 409", status == 409)
+
+status, _, _ = request(
+    f"{GW}/billing/firmware.bin?site=smoke-site&window={new_window}",
+    headers={"If-Match": new_etag, "Range": "bytes=0-9"},
+)
+check("new window downloads", status == 206)
 
 print()
 if failures:
